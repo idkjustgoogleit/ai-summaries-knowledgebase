@@ -1,0 +1,185 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base Styles */
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+  
+  body {
+    @apply bg-dark-bg text-text-primary;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  
+  ::-webkit-scrollbar-track {
+    @apply bg-dark-bg;
+  }
+  
+  ::-webkit-scrollbar-thumb {
+    @apply bg-dark-border rounded;
+  }
+  
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-gray-600;
+  }
+}
+
+/* Custom Utilities */
+@layer utilities {
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+}
+
+/* Component Styles */
+@layer components {
+  .btn {
+    @apply font-semibold rounded-lg transition-colors duration-200;
+  }
+  
+  .input-field {
+    @apply px-4 py-2 bg-dark-card border border-gray-600 rounded text-text-primary 
+           focus:outline-none focus:border-accent transition-colors;
+  }
+  
+  .card {
+    @apply bg-dark-card rounded-lg border border-gray-700;
+  }
+}
+
+/* Header Mobile Menu */
+@layer components {
+  /* Menu hidden by default, shown when active */
+  .menu-container {
+    @apply hidden transition-all duration-300 ease-in-out;
+  }
+  
+  .menu-container.active {
+    @apply block px-4 pb-4 max-h-[500px] overflow-y-auto;
+  }
+}
+
+/* Card Styles */
+@layer components {
+  .card:hover {
+    @apply -translate-y-1 shadow-xl;
+  }
+  
+  .card:hover .card-title {
+    @apply text-accent;
+  }
+}
+
+/* Loading Animation */
+@layer utilities {
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  
+  .animate-spin {
+    animation: spin 1s linear infinite;
+  }
+}
+
+/* Message Styles for Chat */
+@layer components {
+  .message-user {
+    @apply ml-auto mr-4 mb-4 p-4 bg-accent text-white rounded-2xl rounded-br-sm max-w-[80%];
+  }
+  
+  .message-assistant {
+    @apply mr-auto ml-4 mb-4 p-4 bg-dark-card text-text-primary rounded-2xl rounded-bl-sm max-w-[80%];
+  }
+  
+  .message-system {
+    @apply mx-auto mb-4 p-3 bg-gray-700 text-text-secondary rounded-lg text-center;
+  }
+}
+
+/* Form Styles */
+@layer components {
+  .form-group {
+    @apply mb-4;
+  }
+  
+  .form-label {
+    @apply block text-sm font-semibold mb-2 text-text-secondary;
+  }
+  
+  .form-input {
+    @apply w-full px-4 py-2 bg-dark-card border border-gray-600 rounded 
+           text-text-primary placeholder-text-secondary 
+           focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent
+           transition-colors;
+  }
+}
+
+/* Tag Styles */
+@layer components {
+  .tag {
+    @apply inline-block bg-gray-700 text-text-secondary text-xs px-2 py-1 rounded;
+  }
+  
+  .tag:hover {
+    @apply bg-gray-600;
+  }
+}
+
+/* Selection States */
+@layer utilities {
+  .channel-option:hover,
+  .platform-option:hover,
+  .tag-option:hover {
+    @apply bg-gray-600;
+  }
+}
+
+/* Animations */
+@layer utilities {
+  @keyframes fadeIn {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  
+  .animate-fadeIn {
+    animation: fadeIn 0.3s ease-out;
+  }
+}
+
+/* Print Styles */
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}

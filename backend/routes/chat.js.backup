@@ -1,0 +1,1567 @@
+const express = require('express');
+const { debugLog, errorLog } = require('../utils/debugUtils');
+const asyncHandler = require('../middleware/asyncHandler');
+
+const authenticateApiRequest = require('../middleware/apiAuthMiddleware');
+const { logAuditEvent } = require('../auth/shared');
+// Helper function to load chat enhancement configuration from database with defaults
+async function loadChatEnhancementConfig(pool) {
+  try {
+    const configKeys = ['chat_stream_with_reasoning', 'chat_include_metrics', 'chat_debug_reasoning', 'chat_reasoning_format'];
+    const result = await pool.query(
+      'SELECT key, value FROM public.config WHERE key = ANY($1)',
+      [configKeys]
+    );
+    
+    const config = {
+      chat_stream_with_reasoning: true,
+      chat_include_metrics: true,
+      chat_debug_reasoning: false,
+      chat_reasoning_format: 'deepseek'
+    };
+    
+    result.rows.forEach(row => {
+      if (row.key === 'chat_stream_with_reasoning') {
+        config.chat_stream_with_reasoning = row.value === 'true';
+      } else if (row.key === 'chat_include_metrics') {
+        config.chat_include_metrics = row.value === 'true';
+      } else if (row.key === 'chat_debug_reasoning') {
+        config.chat_debug_reasoning = row.value === 'true';
+      } else if (row.key === 'chat_reasoning_format') {
+        config.chat_reasoning_format = row.value || 'deepseek';
+      }
+    });
+    
+    debugLog('CHAT_ENHANCEMENT_CONFIG', 'Chat enhancement configuration loaded', config);
+    return config;
+  } catch (error) {
+    errorLog('CHAT_ENHANCEMENT_CONFIG', 'Error loading chat enhancement configuration, using defaults', error);
+    return {
+      chat_stream_with_reasoning: true,
+      chat_include_metrics: true,
+      chat_debug_reasoning: false,
+      chat_reasoning_format: 'deepseek'
+    };
+  }
+}
+
+// Helper function to parse reasoning content from various LLM formats
+function parseReasoningContent(text) {
+  if (!text || typeof text !== 'string') {
+    debugLog('REASONING_PARSE', 'No text provided, returning null', { textLength: text?.length || 0 });
+    return { reasoning: null, mainContent: text };
+  }
+  
+  // Log the full response for debugging
+  debugLog('REASONING_PARSE', 'Parsing reasoning from full response', {
+    textLength: text.length,
+    textPreview: text.substring(0, 200) + (text.length > 200 ? '...' : '')
+  });
+  
+  // Multiple patterns for different LLM reasoning formats (in priority order)
+  const patterns = [
+    // Claude, DeepSeek format
+    { regex: /<thinking>([\s\S]*?)<\/thinking>/i, name: 'Claude thinking tag' },
+    // Qwen format
+    { regex: /<reasoning>([\s\S]*?)<\/reasoning>/i, name: 'Qwen reasoning tag' },
+    // Qwen3 think tag (using backticks as delimiters)
+    { regex: /```([\s\S]*?)<\/think>/i, name: 'Qwen3 think tag' },
+    // REASONING: prefix format
+    { regex: /REASONING:\s*([\s\S]*?)(?=\n\n|$)/i, name: 'REASONING prefix' },
+    // THINKING: prefix format
+    { regex: /THINKING:\s*([\s\S]*?)(?=\n\n|$)/i, name: 'THINKING prefix' },
+    // Chain of thought format <|...|>
+    { regex: /<\|([\s\S]*?)\|>/, name: 'Chain of thought' },
+    // reasoning_content field (if present in structured response)
+    { regex: /reasoning_content:\s*(.*)/i, name: 'API reasoning field' }
+  ];
+  
+  for (const pattern of patterns) {
+    const match = text.match(pattern.regex);
+    if (match) {
+      const reasoningContent = match[1] ? match[1].trim() : '';
+      const mainContent = text.replace(match[0], '').trim();
+      
+      debugLog('REASONING_PARSE', `Detected ${pattern.name} format`, {
+        reasoningLength: reasoningContent.length,
+        mainContentLength: mainContent.length
+      });
+      
+      return {
+        reasoning: reasoningContent || null,
+        mainContent: mainContent
+      };
+    }
+  }
+  
+  debugLog('REASONING_PARSE', 'No reasoning pattern detected, treating as main content only', {
+    contentLength: text.length
+  });
+  
+  return { reasoning: null, mainContent: text };
+}
+
+// Helper function to load chat AI configuration from database with fallback to environment variables
+async function loadChatAIConfig(pool) {
+    try {
+        const configKeys = ['chat_openai_api_url', 'chat_openai_model', 'chat_openai_system_prompt', 'chat_openai_api_key'];
+        const configResult = await pool.query(
+            'SELECT key, value FROM public.config WHERE key = ANY($1)',
+            [configKeys]
+        );
+        
+        const config = {
+            chat_openai_api_url: process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions',
+            chat_openai_model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+            chat_openai_system_prompt: process.env.OPENAI_SYSTEM_PROMPT || 'You are a helpful assistant that answers questions about provided YouTube video transcripts. Base your answers strictly on transcript. Format your responses using markdown for better readability with headers, lists, and emphasis where appropriate. Be concise and keep your responses short.',
+            chat_openai_api_key: process.env.OPENAI_API_KEY
+        };
+        
+        configResult.rows.forEach(row => {
+            try {
+                const parsedValue = JSON.parse(row.value);
+                config[row.key] = parsedValue.system_prompt !== undefined ? parsedValue.system_prompt : parsedValue;
+            } catch (e) {
+                config[row.key] = row.value;
+            }
+        });
+        
+        // Log configuration source
+        const configSource = {
+            api_url: config.chat_openai_api_url === (process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions') ? 'env' : 'db',
+            model: config.chat_openai_model === (process.env.OPENAI_MODEL || 'gpt-4o-mini') ? 'env' : 'db',
+            system_prompt: 'chat_openai_system_prompt' in configResult.rows.map(r => r.key) ? 'db' : 'env',
+            api_key: config.chat_openai_api_key ? 'db' : 'env'
+        };
+        
+        debugLog('CHAT_CONFIG', 'Chat AI configuration loaded', configSource);
+        return config;
+    } catch (error) {
+        errorLog('CHAT_CONFIG', 'Error loading chat AI configuration from database, using environment variables', error);
+        // Fallback to environment variables
+        return {
+            chat_openai_api_url: process.env.OPENAI_API_URL || 'https://api.openai.com/v1/chat/completions',
+            chat_openai_model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+            chat_openai_system_prompt: process.env.OPENAI_SYSTEM_PROMPT || 'You are a helpful assistant that answers questions about provided YouTube video transcripts. Base your answers strictly on transcript. Format your responses using markdown for better readability with headers, lists, and emphasis where appropriate. Be concise and keep your responses short.',
+            chat_openai_api_key: process.env.OPENAI_API_KEY
+        };
+    }
+}
+
+// Helper function to load PublicAI configuration from database
+async function loadPublicAIConfig(pool) {
+    try {
+        const configKeys = ['chat_publicai_api_url', 'chat_publicai_model', 'chat_publicai_system_prompt', 'chat_publicai_api_key'];
+        const configResult = await pool.query(
+            'SELECT key, value FROM public.config WHERE key = ANY($1)',
+            [configKeys]
+        );
+
+        const config = {
+            chat_publicai_api_url: '',
+            chat_publicai_model: 'gpt-3.5-turbo',
+            chat_publicai_system_prompt: 'You are a helpful AI assistant.',
+            chat_publicai_api_key: ''
+        };
+
+        configResult.rows.forEach(row => {
+            try {
+                const parsedValue = JSON.parse(row.value);
+                config[row.key] = parsedValue.system_prompt !== undefined ? parsedValue.system_prompt : parsedValue;
+            } catch (e) {
+                config[row.key] = row.value;
+            }
+        });
+
+        debugLog('PUBLICAI_CONFIG', 'PublicAI configuration loaded', {
+            hasUrl: !!config.chat_publicai_api_url,
+            hasModel: !!config.chat_publicai_model,
+            hasSystemPrompt: !!config.chat_publicai_system_prompt,
+            hasApiKey: !!config.chat_publicai_api_key
+        });
+        return config;
+    } catch (error) {
+        errorLog('PUBLICAI_CONFIG', 'Error loading PublicAI configuration from database', error);
+        return {
+            chat_publicai_api_url: '',
+            chat_publicai_model: 'gpt-3.5-turbo',
+            chat_publicai_system_prompt: 'You are a helpful AI assistant.',
+            chat_publicai_api_key: ''
+        };
+    }
+}
+
+// Helper function to ensure PublicAI URL includes /chat/completions path
+function ensurePublicAIEndpoint(url) {
+    if (!url) return url;
+    const normalizedUrl = url.trim();
+    if (normalizedUrl.endsWith('/chat/completions')) {
+        return normalizedUrl;
+    }
+    return normalizedUrl.endsWith('/')
+        ? `${normalizedUrl}chat/completions`
+        : `${normalizedUrl}/chat/completions`;
+}
+
+module.exports = function(pool) {
+  const router = express.Router();
+  // Apply authentication to all routes
+  router.use(authenticateApiRequest);
+
+  // Chat with AI using single transcript (existing functionality - enhanced with streaming)
+  router.post('/ask', asyncHandler(async (req, res) => {
+    let abortController = null;
+    let responseTimer = null;
+    try {
+      const { videoId, prompt, mode } = req.body; // Added mode parameter
+
+      if (!videoId || !prompt) {
+        return res.status(400).json({ error: 'Video ID and prompt are required' });
+      }
+
+      // Handle mode routing
+      const chatMode = mode || 'cloud'; // Default to cloud mode
+
+      if (chatMode === 'webgpu') {
+        return res.status(400).json({ error: 'OnDevice mode is not supported for summary details chat. Please use PublicAi or MyCloud mode.' });
+      }
+
+      if (chatMode === 'publicai') {
+        // PublicAI mode - load PublicAi config and proxy request
+        const publicaiConfig = await loadPublicAIConfig(pool);
+
+        if (!publicaiConfig.chat_publicai_api_url) {
+          return res.status(500).json({ error: 'PublicAI is not configured. Please configure it in admin settings.' });
+        }
+
+        // Fetch transcript from database
+        const result = await pool.query(
+          'SELECT transcript_normalized FROM public.import WHERE videoid = $1',
+          [videoId]
+        );
+
+        if (result.rows.length === 0) {
+          return res.status(404).json({ error: 'Video not found' });
+        }
+
+        const transcript = result.rows[0].transcript_normalized;
+
+        if (!transcript) {
+          return res.status(400).json({ error: 'No transcript available for this video' });
+        }
+
+        // Prepare context with transcript
+        const context = `Video Transcript:\n${transcript}\n\nUser Question: ${prompt}`;
+
+        // Create AbortController for stop functionality
+        abortController = new AbortController();
+        req.on('close', () => {
+          if (abortController) {
+            debugLog('CHAT_STOP', 'Client disconnected, aborting PublicAI request');
+            abortController.abort();
+          }
+        });
+
+        const publicaiRequestBody = {
+          model: publicaiConfig.chat_publicai_model || 'gpt-3.5-turbo',
+          messages: [
+            {
+              role: 'system',
+              content: publicaiConfig.chat_publicai_system_prompt || 'You are a helpful AI assistant.'
+            },
+            {
+              role: 'user',
+              content: context
+            }
+          ],
+          stream: true
+        };
+
+        const publicaiHeaders = {
+          'Content-Type': 'application/json'
+        };
+
+        if (publicaiConfig.chat_publicai_api_key) {
+          publicaiHeaders['Authorization'] = `Bearer ${publicaiConfig.chat_publicai_api_key}`;
+        }
+
+        debugLog('PUBLICAI_CHAT', 'Sending request to PublicAI endpoint', {
+          url: publicaiConfig.chat_publicai_api_url,
+          model: publicaiConfig.chat_publicai_model
+        });
+
+        const response = await fetch(ensurePublicAIEndpoint(publicaiConfig.chat_publicai_api_url), {
+          method: 'POST',
+          headers: publicaiHeaders,
+          body: JSON.stringify(publicaiRequestBody),
+          signal: abortController.signal
+        });
+
+        if (!response.ok) {
+          // Improved error handling - check content type first
+          const contentType = response.headers.get('content-type');
+          let errorMessage = response.statusText || 'Unknown error';
+          let errorDetails = null;
+
+          if (contentType && contentType.includes('application/json')) {
+            // JSON error response
+            const errorData = await response.json().catch(() => null);
+            if (errorData) {
+              errorMessage = errorData.error?.message || errorData.message || errorMessage;
+              errorDetails = errorData;
+            }
+          } else {
+            // Non-JSON response (HTML, plain text) - capture first 500 chars
+            const errorText = await response.text();
+            errorDetails = errorText.substring(0, 500);
+            errorLog('PUBLICAI_CHAT', 'Non-JSON error response from PublicAI API', {
+              status: response.status,
+              contentType,
+              errorPreview: errorDetails
+            });
+          }
+
+          // Provide helpful error message for common issues
+          if (response.status === 404) {
+            errorMessage = 'Endpoint not found. Ensure URL includes /chat/completions path for OpenAI-compatible APIs.';
+          } else if (response.status === 401) {
+            errorMessage = 'Authentication failed. Check your API key.';
+          }
+
+          return res.status(response.status).json({
+            error: `PublicAI error: ${errorMessage}`,
+            details: errorDetails,
+            hint: 'PublicAI mode requires an OpenAI-compatible API endpoint with /chat/completions path.'
+          });
+        }
+
+        // Handle streaming response from PublicAI
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        let buffer = '';
+        let fullAnswer = '';
+        let chunkCount = 0;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.substring(6);
+              if (data === '[DONE]') continue;
+
+              try {
+                const parsed = JSON.parse(data);
+                chunkCount++;
+
+                const content = parsed.choices?.[0]?.delta?.content;
+                if (content) {
+                  fullAnswer += content;
+                  res.write(`data: ${JSON.stringify({ chunk: content })}\n\n`);
+                }
+              } catch (e) {
+                // Silently skip unparseable chunks
+              }
+            }
+          }
+        }
+
+        // Send final completion message
+        res.write(`data: ${JSON.stringify({ isComplete: true, answer: fullAnswer })}\n\n`);
+        res.end();
+        return;
+      }
+
+      // Fetch transcript from database
+      const result = await pool.query(
+        'SELECT transcript_normalized FROM public.import WHERE videoid = $1', 
+        [videoId]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'Video not found' });
+      }
+      
+      const transcript = result.rows[0].transcript_normalized;
+      
+      if (!transcript) {
+        return res.status(400).json({ error: 'No transcript available for this video' });
+      }
+      
+      // Prepare context with transcript
+      const context = `Video Transcript:\n${transcript}\n\nUser Question: ${prompt}`;
+      
+      // Load configurations
+      const chatConfig = await loadChatAIConfig(pool);
+      const enhancementConfig = await loadChatEnhancementConfig(pool);
+      const openaiApiKey = chatConfig.chat_openai_api_key;
+      const openaiModel = chatConfig.chat_openai_model;
+      const openaiApiUrl = chatConfig.chat_openai_api_url;
+      const systemPrompt = chatConfig.chat_openai_system_prompt;
+      
+      if (!openaiApiKey) {
+        return res.status(500).json({ error: 'OpenAI API key not configured' });
+      }
+      
+      // Create AbortController for stop functionality
+      abortController = new AbortController();
+      req.on('close', () => {
+        if (abortController) {
+          debugLog('CHAT_STOP', 'Client disconnected, aborting request');
+          abortController.abort();
+        }
+      });
+      
+      debugLog('CHAT_API', 'Sending request to OpenAI', { 
+        model: openaiModel,
+        streaming: enhancementConfig.chat_stream_with_reasoning,
+        metricsEnabled: enhancementConfig.chat_include_metrics
+      });
+      
+      const startTime = Date.now();
+      let fullResponse = '';
+      let usageData = null;
+      
+      const requestBody = {
+        model: openaiModel,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: context
+          }
+        ],
+        stream: enhancementConfig.chat_stream_with_reasoning,
+        stream_options: enhancementConfig.chat_include_metrics ? { include_usage: true } : undefined,
+        reasoning_format: enhancementConfig.chat_reasoning_format  // Use configured reasoning format
+      };
+      
+      const response = await fetch(openaiApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiApiKey}`
+        },
+        body: JSON.stringify(requestBody),
+        signal: abortController.signal
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        errorLog('CHAT_API', 'OpenAI API error', errorData);
+        return res.status(response.status).json({ error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}` });
+      }
+      
+      if (enhancementConfig.chat_stream_with_reasoning) {
+        // Handle streaming response
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        // Track whether we've already sent reasoning
+        let reasoningSent = false;
+        // Buffer for incomplete JSON that spans multiple lines
+        let jsonBuffer = '';
+        // Track reasoning content from streaming deltas (for deepseek format)
+        let streamingReasoning = '';
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const data = line.substring(6);
+              if (data === '[DONE]') continue;
+              
+              // Add to JSON buffer
+              jsonBuffer += data;
+              
+              try {
+                const parsed = JSON.parse(jsonBuffer);
+                // Successfully parsed, clear buffer
+                jsonBuffer = '';
+                
+                debugLog('SSE_PARSE', 'Successfully parsed JSON from SSE', {
+                  bufferLength: jsonBuffer.length,
+                  parsedKeys: Object.keys(parsed)
+                });
+                
+                // Extract usage data if present
+                if (parsed.usage && !usageData) {
+                  usageData = parsed.usage;
+                }
+                
+                if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
+                  const delta = parsed.choices[0].delta;
+                  
+                  // Check for reasoning_content field (deepseek format)
+                  if (delta.reasoning_content) {
+                    streamingReasoning += delta.reasoning_content;
+                    debugLog('SSE_REASONING', 'Received reasoning content from streaming', {
+                      chunkLength: delta.reasoning_content.length,
+                      totalReasoningLength: streamingReasoning.length
+                    });
+                    
+                    // Stream this reasoning chunk to frontend immediately
+                    res.write(`data: ${JSON.stringify({
+                      reasoning_chunk: delta.reasoning_content,
+                      isComplete: false
+                    })}\n\n`);
+                  }
+                  
+                  // Regular content
+                  if (delta.content) {
+                    fullResponse += delta.content;
+                       
+                    // Only send chunk initially
+                    res.write(`data: ${JSON.stringify({
+                      chunk: delta.content,
+                      isComplete: false
+                    })}\n\n`);
+                  }
+                }
+              } catch (e) {
+                debugLog('SSE_PARSE', 'JSON parse error (expected for incomplete buffer)', {
+                  bufferLength: jsonBuffer.length,
+                  bufferPreview: jsonBuffer.substring(0, 100) + (jsonBuffer.length > 100 ? '...' : ''),
+                  error: e.message
+                });
+              }
+            }
+          }
+        }
+        
+        // Use captured reasoning if available (deepseek format), otherwise parse from full response
+        const finalReasoning = streamingReasoning ? streamingReasoning : parseReasoningContent(fullResponse).reasoning;
+        const mainContent = streamingReasoning ? fullResponse : parseReasoningContent(fullResponse).mainContent;
+        
+        debugLog('STREAMING_REASONING', 'Final reasoning resolution', {
+          hasStreamedReasoning: !!streamingReasoning,
+          streamingReasoningLength: streamingReasoning?.length || 0,
+          parsedReasoningLength: finalReasoning?.length || 0,
+          mainContentLength: mainContent?.length || 0
+        });
+        
+        // Send final completion with ALL data (reasoning, mainContent, answer, metrics) in one message
+        const endTime = Date.now();
+        const duration = endTime - startTime;
+        const tokensPerSecond = usageData && usageData.completion_tokens 
+          ? (usageData.completion_tokens / (duration / 1000)).toFixed(2)
+          : null;
+        
+        res.write(`data: ${JSON.stringify({
+          isComplete: true,
+          answer: fullResponse,
+          reasoning: finalReasoning,
+          mainContent: mainContent,
+          metrics: {
+            prompt_tokens: usageData?.prompt_tokens || 0,
+            completion_tokens: usageData?.completion_tokens || 0,
+            total_tokens: usageData?.total_tokens || 0,
+            tokens_per_second: tokensPerSecond,
+            duration_ms: duration
+          }
+        })}\n\n`);
+        
+        res.end();
+        
+        debugLog('CHAT_STREAM_COMPLETE', 'Streaming response complete', {
+          totalTokens: usageData?.total_tokens || 0,
+          tokensPerSecond,
+          duration,
+          hasReasoning: !!finalReasoning,
+          mainContentLength: mainContent?.length || 0
+        });
+      } else {
+        // Non-streaming response (fallback)
+        const data = await response.json();
+        const endTime = Date.now();
+        const duration = endTime - startTime;
+        const tokensPerSecond = data.usage?.completion_tokens 
+          ? (data.usage.completion_tokens / (duration / 1000)).toFixed(2)
+          : null;
+        
+        const answer = data.choices[0]?.message?.content || "No response from AI";
+        
+        // Parse reasoning content
+        const parsedReasoning = parseReasoningContent(answer);
+        
+        logAuditEvent('READ', 'chat', { endpoint: 'ask', videoId }, req.user, req);
+        res.json({
+          answer: parsedReasoning.mainContent,
+          reasoning: parsedReasoning.reasoning,
+          metrics: {
+            prompt_tokens: data.usage?.prompt_tokens || 0,
+            completion_tokens: data.usage?.completion_tokens || 0,
+            total_tokens: data.usage?.total_tokens || 0,
+            tokens_per_second: tokensPerSecond,
+            duration_ms: duration
+          }
+        });
+        
+        debugLog('CHAT_COMPLETE', 'Non-streaming response complete', {
+          totalTokens: data.usage?.total_tokens || 0,
+          tokensPerSecond,
+          duration
+        });
+      }
+    } finally {
+      if (responseTimer) clearTimeout(responseTimer);
+    }
+  }));
+
+  // Chat with AI using multiple transcripts (new functionality)
+  router.post('/ask-multiple', asyncHandler(async (req, res) => {
+      const { videoIds, prompt } = req.body;
+      
+      if (!videoIds || !Array.isArray(videoIds) || videoIds.length === 0 || !prompt) {
+        return res.status(400).json({ error: 'Video IDs array and prompt are required' });
+      }
+
+      // Fetch transcripts from database - FIXED COLUMN NAMES
+      const transcriptResult = await pool.query(
+        'SELECT videoid, title, transcript_normalized FROM public.import WHERE videoid = ANY($1)', 
+        [videoIds]
+      );
+      
+      if (transcriptResult.rows.length === 0) {
+        return res.status(404).json({ error: 'Videos not found' });
+      }
+      
+      // Prepare context with all transcripts
+      let context = "Multiple Video Transcripts:\n\n";
+      transcriptResult.rows.forEach(row => {
+        if (row.transcript_normalized) {
+          context += `Video Title: ${row.title || row.videoid}\nTranscript:\n${row.transcript_normalized}\n\n`;
+        }
+      });
+      
+      context += `\nUser Question: ${prompt}`;
+      
+      // Load chat AI configuration from database with fallback to environment variables
+      const chatConfig = await loadChatAIConfig(pool);
+      const openaiApiKey = chatConfig.chat_openai_api_key;
+      const openaiModel = chatConfig.chat_openai_model;
+      const openaiApiUrl = chatConfig.chat_openai_api_url;
+      const systemPrompt = chatConfig.chat_openai_system_prompt;
+      
+      if (!openaiApiKey) {
+        return res.status(500).json({ error: 'OpenAI API key not configured' });
+      }
+      
+      debugLog('CHAT_API', 'Sending request to OpenAI', { model: openaiModel });
+      
+      const requestBody = {
+        model: openaiModel,
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          },
+          {
+            role: "user",
+            content: context
+          }
+        ]
+      };
+      
+      const response = await fetch(openaiApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${openaiApiKey}`
+        },
+        body: JSON.stringify(requestBody)
+      });
+      
+      if (!response.ok) {
+        const errorData = await response.json();
+        errorLog('CHAT_API', 'OpenAI API error', errorData);
+        return res.status(response.status).json({ error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}` });
+      }
+      
+      const data = await response.json();
+      const answer = data.choices[0]?.message?.content || "No response from AI";
+
+      res.json({ answer });
+      logAuditEvent('READ', 'chat', { endpoint: 'ask-multiple', videoIds }, req.user, req);
+  }));
+
+// --- NEW ENDPOINT: Chat about selected summaries (videos or websites) ---
+router.post('/ask-summaries', asyncHandler(async (req, res) => {
+    let abortController = null;
+    let responseTimer = null;
+    try {
+        const { summaryIds, prompt, mode } = req.body;
+
+        if (!summaryIds || !Array.isArray(summaryIds) || summaryIds.length === 0) {
+            return res.status(400).json({ error: 'A list of summary IDs is required.' });
+        }
+        if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
+            return res.status(400).json({ error: 'A non-empty prompt is required.' });
+        }
+
+        const chatMode = mode || 'cloud'; // Default to cloud mode
+
+        debugLog('CHAT_SUMMARIES', `Request to chat about ${summaryIds.length} summaries. Mode: ${chatMode}`);
+
+        // Load chat AI configuration
+        const chatConfig = await loadChatAIConfig(pool);
+        const enhancementConfig = await loadChatEnhancementConfig(pool);
+        const openaiApiKey = chatConfig.chat_openai_api_key;
+        const openaiModel = chatConfig.chat_openai_model;
+        const openaiApiUrl = chatConfig.chat_openai_api_url;
+        const systemPrompt = chatConfig.chat_openai_system_prompt;
+
+        if (!openaiApiKey) {
+            return res.status(500).json({ error: 'OpenAI API key not configured' });
+        }
+
+        // Create AbortController for stop functionality
+        abortController = new AbortController();
+        req.on('close', () => {
+            if (abortController) {
+                debugLog('CHAT_STOP', 'Client disconnected from ask-summaries, aborting request');
+                abortController.abort();
+            }
+        });
+
+        // Fetch all summaries requested (from both tables)
+        const summaryPromises = summaryIds.map(async (id) => {
+            let result = await pool.query(
+                `SELECT s.*, i.platform, i.url, 'video' as source_type 
+                 FROM public.summaries s 
+                 LEFT JOIN public.import i ON s.videoid = i.videoid 
+                 WHERE s.videoid = $1 AND s.status = 'DONE'`,
+                [id]
+            );
+            if (result.rows.length > 0) return result.rows[0];
+            
+            result = await pool.query(
+                `SELECT *, 'website' as source_type FROM public.summaries_websites WHERE id = $1 AND status = 'DONE'`,
+                [id]
+            );
+            if (result.rows.length > 0) return result.rows[0];
+            
+            result = await pool.query(
+                `SELECT sc.*, ic.content as import_content, 'custom' as source_type 
+                 FROM public.summaries_custom sc 
+                 LEFT JOIN public.import_custom ic ON sc.import_id = ic.id 
+                 WHERE sc.id = $1 AND sc.status = 'DONE'`,
+                [id]
+            );
+            if (result.rows.length > 0) return result.rows[0];
+            
+            return null;
+        });
+
+        const summaries = (await Promise.all(summaryPromises)).filter(s => s !== null);
+
+        if (summaries.length === 0) {
+             return res.status(404).json({ error: 'None of the provided summary IDs could be found or were not processed yet (status not DONE).' });
+        }
+        
+        // --- Prepare Context for AI ---
+        const detailedSummaryParts = summaries.map(summary => {
+            if (summary.source_type === 'website') {
+                return `[WEBSITE SUMMARY ID: ${summary.id}]
+Title: ${summary.title}
+URL: ${summary.url}
+Type: ${summary.type}
+TL;DR: ${summary.tldr}
+Description: ${summary.description}
+Tags: ${Array.isArray(summary.tags) ? summary.tags.join(', ') : summary.tags}
+[Summary Data Ends]`;
+            } else if (summary.source_type === 'custom') {
+                return `[CUSTOM SUMMARY ID: ${summary.id}]
+Title: ${summary.title}
+Type: Custom Content
+TL;DR: ${summary.tldr}
+Description: ${summary.description}
+Tags: ${Array.isArray(summary.tags) ? summary.tags.join(', ') : JSON.stringify(summary.tags)}
+${summary.import_content ? `Original Content: ${summary.import_content}` : ''}
+[Summary Data Ends]`;
+            } else {
+                return `[VIDEO SUMMARY ID: ${summary.videoid}]
+Title: ${summary.name} 
+Channel: ${summary.channel} 
+URL: ${summary.url}
+Type: ${summary.type || 'Video'}
+TL;DR: ${summary.other2 || summary.tldr} 
+Description: ${summary.description} 
+Tags: ${Array.isArray(summary.tags) ? summary.tags.join(', ') : summary.tags}
+[Summary Data Ends]`;
+            }
+        });
+
+        const aggregatedContext = `CONTEXT FOR AI CHAT:\n${detailedSummaryParts.join('\n\n')} \n\nUSER PROMPT: ${prompt}`;
+        // --- End Prepare Context ---
+
+        // Handle PublicAI mode
+        if (chatMode === 'publicai') {
+            const publicaiConfig = await loadPublicAIConfig(pool);
+
+            if (!publicaiConfig.chat_publicai_api_url) {
+                return res.status(500).json({ error: 'PublicAI is not configured. Please configure it in admin settings.' });
+            }
+
+            const publicaiRequestBody = {
+                model: publicaiConfig.chat_publicai_model || 'gpt-3.5-turbo',
+                messages: [
+                    {
+                        role: 'system',
+                        content: publicaiConfig.chat_publicai_system_prompt || 'You are a helpful AI assistant.'
+                    },
+                    {
+                        role: 'user',
+                        content: aggregatedContext
+                    }
+                ],
+                stream: true
+            };
+
+            const publicaiHeaders = {
+                'Content-Type': 'application/json'
+            };
+
+            if (publicaiConfig.chat_publicai_api_key) {
+                publicaiHeaders['Authorization'] = `Bearer ${publicaiConfig.chat_publicai_api_key}`;
+            }
+
+            debugLog('PUBLICAI_CHAT', 'Sending ask-summaries request to PublicAI endpoint', {
+                url: publicaiConfig.chat_publicai_api_url,
+                model: publicaiConfig.chat_publicai_model
+            });
+
+            const response = await fetch(ensurePublicAIEndpoint(publicaiConfig.chat_publicai_api_url), {
+                method: 'POST',
+                headers: publicaiHeaders,
+                body: JSON.stringify(publicaiRequestBody),
+                signal: abortController.signal
+            });
+
+            if (!response.ok) {
+                const contentType = response.headers.get('content-type');
+                let errorMessage = response.statusText || 'Unknown error';
+                let errorDetails = null;
+
+                if (contentType && contentType.includes('application/json')) {
+                    const errorData = await response.json().catch(() => null);
+                    if (errorData) {
+                        errorMessage = errorData.error?.message || errorData.message || errorMessage;
+                        errorDetails = errorData;
+                    }
+                } else {
+                    const errorText = await response.text();
+                    errorDetails = errorText.substring(0, 500);
+                    errorLog('PUBLICAI_CHAT', 'Non-JSON error response from PublicAI API', {
+                        status: response.status,
+                        contentType,
+                        errorPreview: errorDetails
+                    });
+                }
+
+                return res.status(response.status).json({
+                    error: `PublicAI error: ${errorMessage}`,
+                    details: errorDetails,
+                    hint: 'PublicAI mode requires an OpenAI-compatible API endpoint with /chat/completions path.'
+                });
+            }
+
+            // Proxy streaming response
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+
+            let buffer = '';
+            let fullAnswer = '';
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.substring(6);
+                        if (data === '[DONE]') continue;
+
+                        try {
+                            const parsed = JSON.parse(data);
+                            const content = parsed.choices?.[0]?.delta?.content;
+                            if (content) {
+                                fullAnswer += content;
+                                res.write(`data: ${JSON.stringify({
+                                    chunk: content,
+                                    isComplete: false
+                                })}\n\n`);
+                            }
+                        } catch (e) {
+                            // Skip parse errors
+                        }
+                    }
+                }
+            }
+
+            res.write(`data: ${JSON.stringify({
+                isComplete: true,
+                answer: fullAnswer
+            })}\n\n`);
+
+            res.end();
+            return;
+        }
+
+        // Cloud mode (default)
+        debugLog('CHAT_API', 'Sending request to OpenAI for ask-summaries', {
+            model: openaiModel,
+            streaming: enhancementConfig.chat_stream_with_reasoning,
+            metricsEnabled: enhancementConfig.chat_include_metrics,
+            summariesCount: summaries.length
+        });
+        
+        const startTime = Date.now();
+        let fullResponse = '';
+        let usageData = null;
+        
+        const requestBody = {
+            model: openaiModel,
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                {
+                    role: "user",
+                    content: aggregatedContext
+                }
+            ],
+            stream: enhancementConfig.chat_stream_with_reasoning,
+            stream_options: enhancementConfig.chat_include_metrics ? { include_usage: true } : undefined,
+            reasoning_format: enhancementConfig.chat_reasoning_format  // Use configured reasoning format
+        };
+        
+        const response = await fetch(openaiApiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${openaiApiKey}`
+            },
+            body: JSON.stringify(requestBody),
+            signal: abortController.signal
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            errorLog('CHAT_SUMMARIES', 'OpenAI API error', errorData);
+            return res.status(response.status).json({ error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}` });
+        }
+        
+        if (enhancementConfig.chat_stream_with_reasoning) {
+            // Handle streaming response
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+            
+            // Buffer for incomplete JSON that spans multiple lines
+            let jsonBuffer = '';
+            // Track reasoning content from streaming deltas (for deepseek format)
+            let streamingReasoning = '';
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                
+                const chunk = decoder.decode(value, { stream: true });
+                const lines = chunk.split('\n');
+                
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.substring(6);
+                        if (data === '[DONE]') continue;
+                        
+                        // Add to JSON buffer
+                        jsonBuffer += data;
+                        
+                        try {
+                            const parsed = JSON.parse(jsonBuffer);
+                            // Successfully parsed, clear buffer
+                            jsonBuffer = '';
+                            
+                            // Extract usage data if present
+                            if (parsed.usage && !usageData) {
+                                usageData = parsed.usage;
+                            }
+                            
+                            if (parsed.choices && parsed.choices[0] && parsed.choices[0].delta) {
+                                const delta = parsed.choices[0].delta;
+                                
+                                // Check for reasoning_content field (deepseek format)
+                                if (delta.reasoning_content) {
+                                    streamingReasoning += delta.reasoning_content;
+                                    debugLog('SSE_REASONING', 'Received reasoning content from streaming in ask-summaries', {
+                                        chunkLength: delta.reasoning_content.length,
+                                        totalReasoningLength: streamingReasoning.length
+                                    });
+                                    
+                                    // Stream this reasoning chunk to frontend immediately
+                                    res.write(`data: ${JSON.stringify({
+                                        reasoning_chunk: delta.reasoning_content,
+                                        isComplete: false
+                                    })}\n\n`);
+                                }
+                                
+                                // Regular content
+                                if (delta.content) {
+                                    fullResponse += delta.content;
+                                       
+                                    // Only send chunk initially
+                                    res.write(`data: ${JSON.stringify({
+                                        chunk: delta.content,
+                                        isComplete: false
+                                    })}\n\n`);
+                                }
+                            }
+                        } catch (e) {
+                            debugLog('SSE_PARSE', 'JSON parse error (expected for incomplete buffer) in ask-summaries', {
+                                bufferLength: jsonBuffer.length,
+                                bufferPreview: jsonBuffer.substring(0, 100) + (jsonBuffer.length > 100 ? '...' : ''),
+                                error: e.message
+                            });
+                        }
+                    }
+                }
+            }
+            
+            // Use captured reasoning if available (deepseek format), otherwise parse from full response
+            const finalReasoning = streamingReasoning ? streamingReasoning : parseReasoningContent(fullResponse).reasoning;
+            const mainContent = streamingReasoning ? fullResponse : parseReasoningContent(fullResponse).mainContent;
+            
+            debugLog('STREAMING_REASONING', 'Final reasoning resolution in ask-summaries', {
+                hasStreamedReasoning: !!streamingReasoning,
+                streamingReasoningLength: streamingReasoning?.length || 0,
+                parsedReasoningLength: finalReasoning?.length || 0,
+                mainContentLength: mainContent?.length || 0
+            });
+            
+            // Send final completion with ALL data (reasoning, mainContent, answer, metrics) in one message
+            const endTime = Date.now();
+            const duration = endTime - startTime;
+            const tokensPerSecond = usageData && usageData.completion_tokens 
+                ? (usageData.completion_tokens / (duration / 1000)).toFixed(2)
+                : null;
+            
+            res.write(`data: ${JSON.stringify({
+                isComplete: true,
+                answer: fullResponse,
+                reasoning: finalReasoning,
+                mainContent: mainContent,
+                metrics: {
+                    prompt_tokens: usageData?.prompt_tokens || 0,
+                    completion_tokens: usageData?.completion_tokens || 0,
+                    total_tokens: usageData?.total_tokens || 0,
+                    tokens_per_second: tokensPerSecond,
+                    duration_ms: duration
+                }
+            })}\n\n`);
+            
+            res.end();
+            
+            debugLog('CHAT_STREAM_COMPLETE', 'Streaming response complete for ask-summaries', {
+                totalTokens: usageData?.total_tokens || 0,
+                tokensPerSecond,
+                duration,
+                hasReasoning: !!finalReasoning,
+                mainContentLength: mainContent?.length || 0
+            });
+        } else {
+            // Non-streaming response (fallback)
+            const data = await response.json();
+            const endTime = Date.now();
+            const duration = endTime - startTime;
+            const tokensPerSecond = data.usage?.completion_tokens 
+                ? (data.usage.completion_tokens / (duration / 1000)).toFixed(2)
+                : null;
+            
+            const answer = data.choices[0]?.message?.content || "I couldn't formulate a response based on the summaries.";
+            
+            // Parse reasoning content
+            const parsedReasoning = parseReasoningContent(answer);
+            
+            res.json({
+                answer: parsedReasoning.mainContent,
+                reasoning: parsedReasoning.reasoning,
+                metrics: {
+                    prompt_tokens: data.usage?.prompt_tokens || 0,
+                    completion_tokens: data.usage?.completion_tokens || 0,
+                    total_tokens: data.usage?.total_tokens || 0,
+                    tokens_per_second: tokensPerSecond,
+                    duration_ms: duration
+                }
+            });
+            
+            debugLog('CHAT_SUMMARIES', 'Response generated successfully');
+            
+            debugLog('CHAT_COMPLETE', 'Non-streaming response complete for ask-summaries', {
+                totalTokens: data.usage?.total_tokens || 0,
+                tokensPerSecond,
+                duration
+            });
+        }
+        
+    } finally {
+        if (responseTimer) clearTimeout(responseTimer);
+    }
+}));
+// --- END NEW ENDPOINT ---
+
+// Chat with AI using tag-based summaries (new functionality)
+router.post('/ask-tags', asyncHandler(async (req, res) => {
+        const { tags, prompt } = req.body;
+        
+        if (!tags || !Array.isArray(tags) || tags.length === 0 || !prompt) {
+            return res.status(400).json({ error: 'Tags array and prompt are required' });
+        }
+
+        // Fetch summaries by tags from database
+        const summaryResult = await pool.query(
+            'SELECT videoid, name, summary FROM public.summaries WHERE tags ILIKE ANY($1) LIMIT 10', 
+            [tags.map(tag => `%${tag}%`)]
+        );
+        
+        if (summaryResult.rows.length === 0) {
+            return res.status(404).json({ error: 'No summaries found for selected tags' });
+        }
+        
+        // Prepare context with all summaries
+        let context = "Video Summaries by Tags:\n\n";
+        summaryResult.rows.forEach(row => {
+            if (row.summary) {
+                context += `Video Title: ${row.name || row.videoid}\nSummary:\n${row.summary}\n\n`;
+            }
+        });
+        
+        context += `\nUser Question: ${prompt}`;
+        
+        // Load chat AI configuration from database with fallback to environment variables
+        const chatConfig = await loadChatAIConfig(pool);
+        const openaiApiKey = chatConfig.chat_openai_api_key;
+        const openaiModel = chatConfig.chat_openai_model;
+        const openaiApiUrl = chatConfig.chat_openai_api_url;
+        const systemPrompt = chatConfig.chat_openai_system_prompt;
+        
+        if (!openaiApiKey) {
+            return res.status(500).json({ error: 'OpenAI API key not configured' });
+        }
+        
+        debugLog('CHAT_API', 'Sending request to OpenAI', { model: openaiModel });
+        
+        const requestBody = {
+            model: openaiModel,
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                {
+                    role: "user",
+                    content: context
+                }
+            ]
+        };
+        
+        const response = await fetch(openaiApiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${openaiApiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+        
+        if (!response.ok) {
+            const errorData = await response.json();
+            errorLog('CHAT_API', 'OpenAI API error', errorData);
+            return res.status(response.status).json({ error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}` });
+        }
+        
+        const data = await response.json();
+        const answer = data.choices[0]?.message?.content || "No response from AI";
+
+        res.json({ answer });
+}));
+        logAuditEvent('READ', 'chat', { endpoint: 'ask-tags', tags }, req.user, req);
+
+
+// Chat with AI using website summary data (NEW)
+router.post('/ask-website-summary', asyncHandler(async (req, res) => {
+        const { websiteId, prompt, mode } = req.body; // Added mode parameter
+
+        if (!websiteId || !prompt) {
+            return res.status(400).json({ error: 'Website ID and prompt are required' });
+        }
+
+        // Handle mode routing
+        const chatMode = mode || 'cloud'; // Default to cloud mode
+
+        if (chatMode === 'webgpu') {
+            return res.status(400).json({ error: 'OnDevice mode is not supported for summary details chat. Please use PublicAi or MyCloud mode.' });
+        }
+
+        // Fetch website summary from database
+        const result = await pool.query(
+            'SELECT * FROM public.summaries_websites WHERE id = $1 AND status = $2',
+            [websiteId, 'DONE']
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'Processed website summary not found' });
+        }
+
+        const websiteSummary = result.rows[0];
+
+        // Prepare context with website summary data
+        const context = `Website Summary Data:\n${JSON.stringify(websiteSummary, null, 2)}\n\nUser Question: ${prompt}`;
+
+        // Handle PublicAI mode
+        if (chatMode === 'publicai') {
+            const publicaiConfig = await loadPublicAIConfig(pool);
+
+            if (!publicaiConfig.chat_publicai_api_url) {
+                return res.status(500).json({ error: 'PublicAI is not configured. Please configure it in admin settings.' });
+            }
+
+            const publicaiRequestBody = {
+                model: publicaiConfig.chat_publicai_model || 'gpt-3.5-turbo',
+                messages: [
+                    {
+                        role: 'system',
+                        content: publicaiConfig.chat_publicai_system_prompt || 'You are a helpful AI assistant.'
+                    },
+                    {
+                        role: 'user',
+                        content: context
+                    }
+                ]
+            };
+
+            const publicaiHeaders = {
+                'Content-Type': 'application/json'
+            };
+
+            if (publicaiConfig.chat_publicai_api_key) {
+                publicaiHeaders['Authorization'] = `Bearer ${publicaiConfig.chat_publicai_api_key}`;
+            }
+
+            debugLog('PUBLICAI_CHAT', 'Sending website summary request to PublicAI endpoint', {
+                url: publicaiConfig.chat_publicai_api_url,
+                model: publicaiConfig.chat_publicai_model
+            });
+
+            const response = await fetch(ensurePublicAIEndpoint(publicaiConfig.chat_publicai_api_url), {
+                method: 'POST',
+                headers: publicaiHeaders,
+                body: JSON.stringify(publicaiRequestBody)
+            });
+
+            if (!response.ok) {
+                // Improved error handling - check content type first
+                const contentType = response.headers.get('content-type');
+                let errorMessage = response.statusText || 'Unknown error';
+                let errorDetails = null;
+
+                if (contentType && contentType.includes('application/json')) {
+                    const errorData = await response.json().catch(() => null);
+                    if (errorData) {
+                        errorMessage = errorData.error?.message || errorData.message || errorMessage;
+                        errorDetails = errorData;
+                    }
+                } else {
+                    const errorText = await response.text();
+                    errorDetails = errorText.substring(0, 500);
+                    errorLog('PUBLICAI_CHAT', 'Non-JSON error response from PublicAI API', {
+                        status: response.status,
+                        contentType,
+                        errorPreview: errorDetails
+                    });
+                }
+
+                if (response.status === 404) {
+                    errorMessage = 'Endpoint not found. Ensure URL includes /chat/completions path.';
+                } else if (response.status === 401) {
+                    errorMessage = 'Authentication failed. Check your API key.';
+                }
+
+                return res.status(response.status).json({
+                    error: `PublicAI error: ${errorMessage}`,
+                    details: errorDetails,
+                    hint: 'PublicAI mode requires an OpenAI-compatible API endpoint with /chat/completions path.'
+                });
+            }
+
+            const answer = data.choices[0]?.message?.content || "No response from AI";
+
+            logAuditEvent('READ', 'chat', { endpoint: 'ask-website-summary', websiteId }, req.user, req);
+            res.json({ answer });
+            return;
+        }
+            logAuditEvent('READ', 'chat', { endpoint: 'ask-summaries', summaryIds }, req.user, req);
+        // Cloud mode (default) - Load chat AI configuration from database with fallback to environment variables
+        const chatConfig = await loadChatAIConfig(pool);
+        const openaiApiKey = chatConfig.chat_openai_api_key;
+        const openaiModel = chatConfig.chat_openai_model;
+        const openaiApiUrl = chatConfig.chat_openai_api_url;
+        const systemPrompt = chatConfig.chat_openai_system_prompt;
+
+        if (!openaiApiKey) {
+            return res.status(500).json({ error: 'OpenAI API key not configured' });
+        }
+        
+        debugLog('CHAT_WEBSITE', `Sending website summary chat request to OpenAI with model: ${openaiModel}`);
+        
+        const requestBody = {
+            model: openaiModel,
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                {
+                    role: "user",
+                    content: context
+                }
+            ]
+        };
+        
+        const response = await fetch(openaiApiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${openaiApiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+        
+        if (!response.ok) {
+            const errorData = await response.json();
+            errorLog('CHAT_API', 'OpenAI API error', errorData);
+            return res.status(response.status).json({ 
+                error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}` 
+            });
+        }
+        
+        const data = await response.json();
+        const answer = data.choices[0]?.message?.content || "No response from AI";
+
+        res.json({ answer });
+}));
+
+// --- NEW ENDPOINT: Chat about custom summary with imported content ---
+router.post('/ask-custom-summary', asyncHandler(async (req, res) => {
+    const { summaryId, prompt, mode } = req.body;
+
+    if (!summaryId || !prompt) {
+            return res.status(400).json({ error: 'Summary ID and prompt are required' });
+        }
+
+        // Handle mode routing
+        const chatMode = mode || 'cloud'; // Default to cloud mode
+
+        if (chatMode === 'webgpu') {
+            return res.status(400).json({ error: 'OnDevice mode is not supported for summary details chat. Please use PublicAi or MyCloud mode.' });
+        }
+
+        // Fetch custom summary from database
+        const summaryResult = await pool.query(
+            'SELECT sc.*, ic.content as import_content FROM public.summaries_custom sc LEFT JOIN public.import_custom ic ON sc.import_id = ic.id WHERE sc.id = $1 AND sc.status = $2',
+            [summaryId, 'DONE']
+        );
+
+        if (summaryResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Processed custom summary not found' });
+        }
+
+        const customSummary = summaryResult.rows[0];
+
+        // Prepare context with custom summary and imported content
+        let context = `Custom Summary Data:\n${JSON.stringify(customSummary, null, 2)}\n\n`;
+        if (customSummary.import_content) {
+            context += `Imported Content:\n${customSummary.import_content}\n\n`;
+        }
+        context += `User Question: ${prompt}`;
+
+        // Handle PublicAI mode
+        if (chatMode === 'publicai') {
+            const publicaiConfig = await loadPublicAIConfig(pool);
+
+            if (!publicaiConfig.chat_publicai_api_url) {
+                return res.status(500).json({ error: 'PublicAI is not configured. Please configure it in admin settings.' });
+            }
+
+            const publicaiRequestBody = {
+                model: publicaiConfig.chat_publicai_model || 'gpt-3.5-turbo',
+                messages: [
+                    {
+                        role: 'system',
+                        content: publicaiConfig.chat_publicai_system_prompt || 'You are a helpful AI assistant.'
+                    },
+                    {
+                        role: 'user',
+                        content: context
+                    }
+                ]
+            };
+
+            const publicaiHeaders = {
+                'Content-Type': 'application/json'
+            };
+
+            if (publicaiConfig.chat_publicai_api_key) {
+                publicaiHeaders['Authorization'] = `Bearer ${publicaiConfig.chat_publicai_api_key}`;
+            }
+
+            debugLog('PUBLICAI_CHAT', 'Sending custom summary request to PublicAI endpoint', {
+                url: publicaiConfig.chat_publicai_api_url,
+                model: publicaiConfig.chat_publicai_model
+            });
+
+            const response = await fetch(ensurePublicAIEndpoint(publicaiConfig.chat_publicai_api_url), {
+                method: 'POST',
+                headers: publicaiHeaders,
+                body: JSON.stringify(publicaiRequestBody)
+            });
+
+            if (!response.ok) {
+                // Improved error handling - check content type first
+                const contentType = response.headers.get('content-type');
+                let errorMessage = response.statusText || 'Unknown error';
+                let errorDetails = null;
+
+                if (contentType && contentType.includes('application/json')) {
+                    const errorData = await response.json().catch(() => null);
+                    if (errorData) {
+                        errorMessage = errorData.error?.message || errorData.message || errorMessage;
+                        errorDetails = errorData;
+                    }
+                } else {
+                    const errorText = await response.text();
+                    errorDetails = errorText.substring(0, 500);
+                    errorLog('PUBLICAI_CHAT', 'Non-JSON error response from PublicAI API', {
+                        status: response.status,
+                        contentType,
+                        errorPreview: errorDetails
+                    });
+                }
+
+                if (response.status === 404) {
+                    errorMessage = 'Endpoint not found. Ensure URL includes /chat/completions path.';
+                } else if (response.status === 401) {
+                    errorMessage = 'Authentication failed. Check your API key.';
+                }
+
+                return res.status(response.status).json({
+                    error: `PublicAI error: ${errorMessage}`,
+                    details: errorDetails,
+                    hint: 'PublicAI mode requires an OpenAI-compatible API endpoint with /chat/completions path.'
+                });
+            }
+
+            const data = await response.json();
+            const answer = data.choices[0]?.message?.content || "No response from AI";
+
+            res.json({ answer });
+            return;
+        }
+
+        // Cloud mode (default) - Load chat AI configuration from database with fallback to environment variables
+        const openaiApiKey = chatConfig.chat_openai_api_key;
+        const openaiApiUrl = chatConfig.chat_openai_api_url;
+        const systemPrompt = chatConfig.chat_openai_system_prompt;
+
+        if (!openaiApiKey) {
+            return res.status(500).json({ error: 'OpenAI API key not configured' });
+        }
+
+        debugLog('CHAT_CUSTOM', `Sending custom summary chat request to OpenAI with model: ${openaiModel}`);
+
+        const requestBody = {
+            model: openaiModel,
+            messages: [
+                {
+                    role: "system",
+                    content: systemPrompt
+                },
+                {
+                    role: "user",
+                    content: context
+                }
+            ]
+        };
+
+        const response = await fetch(openaiApiUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${openaiApiKey}`
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json();
+            errorLog('CHAT_API', 'OpenAI API error', errorData);
+            return res.status(response.status).json({
+                error: `OpenAI API error: ${errorData.error?.message || 'Unknown error'}`
+            });
+        }
+
+        const data = await response.json();
+        const answer = data.choices[0]?.message?.content || "No response from AI";
+
+        res.json({ answer });
+}));
+        logAuditEvent('READ', 'chat', { endpoint: 'ask-custom-summary', summaryId }, req.user, req);
+// --- END NEW ENDPOINT ---
+// Get all active chat prompts
+    debugLog('CHAT_PROMPTS', 'Fetching active prompts');
+    const result = await pool.query(
+        'SELECT * FROM public.chat_prompts WHERE is_active = true ORDER BY category, title'
+    );
+    debugLog('CHAT_PROMPTS', `Retrieved ${result.rows.length} active prompts`);
+    res.json(result.rows);
+}));
+
+  return router;
+};
+        logAuditEvent('READ', 'chat', { endpoint: 'prompts', count: result.rows.length }, req.user, req);

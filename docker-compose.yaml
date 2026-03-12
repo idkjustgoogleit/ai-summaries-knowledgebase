@@ -1,0 +1,70 @@
+version: '3.8'
+
+services:
+  summary-library:
+    hostname: summaries
+    container_name: summaries
+    image: node:20-slim
+    #ports:
+    #  - "5500:5000"
+    env_file:
+      - .env
+    environment:
+      - 'DATABASE_URL=postgresql://${DB_USER:-admin}:${DB_PASSWORD}@${DB_HOST:-postgres}:${DB_PORT:-5432}/${DB_NAME:-summariesdb}'
+      - 'NODE_ENV=${NODE_ENV:-production}'
+      - 'DEBUG_MODE=${DEBUG_MODE:-false}'
+    working_dir: /app
+    networks:
+      my-srv-lan:
+        ipv4_address: 172.18.0.99
+    volumes:
+      - /data/ai-summaries:/app
+    command: >
+      bash -c "
+        cd backend &&
+        npm install &&
+        cd ../frontend &&
+        npm install &&
+        npx vite build &&
+        cd ../backend &&
+        node server.js
+      "
+      
+  summaries-worker:
+    hostname: summaries-worker
+    container_name: summaries-worker
+    image: node:20-bookworm
+    #ports:
+    #  - "5500:5000"
+    env_file:
+      - .env
+    environment:
+      - 'APP_MODE=WORKER'
+      - 'DATABASE_URL=postgresql://${DB_USER:-admin}:${DB_PASSWORD}@${DB_HOST:-postgres}:${DB_PORT:-5432}/${DB_NAME:-summariesdb}'
+      - 'NODE_ENV=${NODE_ENV:-production}'
+      - 'DEBUG_MODE=${DEBUG_MODE:-false}'
+    working_dir: /app
+    networks:
+      my-srv-lan:
+        ipv4_address: 172.18.0.100
+    volumes:
+      - /data/ai-summaries:/app
+    command: >
+      bash -c "
+        apt-get update &&
+        apt-get install -y python3 python3-pip &&
+        python3 -m pip install --break-system-packages --upgrade pip &&
+        python3 -m pip install --break-system-packages youtube-transcript-api yt-dlp &&
+        echo 'Verifying youtube-transcript-api installation...' &&
+        python3 -c 'from youtube_transcript_api import YouTubeTranscriptApi; print(\"SUCCESS: youtube-transcript-api verified!\")' &&
+        echo 'Verifying yt-dlp installation...' &&
+        yt-dlp --version && echo 'SUCCESS: yt-dlp verified!' &&
+        cd backend &&
+        npm install &&
+        node worker/index.js
+      "
+
+networks:
+  my-srv-lan:
+    name: my-srv-lan
+    external: true
